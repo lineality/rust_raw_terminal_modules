@@ -554,24 +554,40 @@ fn get_terminal_attr(fd: i32) -> io::Result<Termios> {
     let ret = unsafe { ioctl_read_termios(fd, TCGETS, &mut termios) };
 
     if ret < 0 {
-        return Err(io::Error::from_raw_os_error((-ret) as i32));
+        // Linux errnos are small positive integers (1..=4095). A negative
+        // return outside this range indicates a corrupted/implausible syscall
+        // result (bit-flip, HW fault). Map anything out of range to EIO so the
+        // error is honest rather than a truncated garbage errno.
+        let errno = -ret;
+        let safe_errno = if (1..=4095).contains(&errno) {
+            errno as i32
+        } else {
+            5 // EIO: I/O error — generic, honest "something went wrong"
+        };
+        return Err(io::Error::from_raw_os_error(safe_errno));
     }
 
     // -------------------------------------------------------------------------
     // Sanity check: validate kernel response
     // -------------------------------------------------------------------------
     // Per production rules: "Every return should be checked for what can be
-    // checked." A termios with c_cflag containing no character size bits
-    // is invalid - this catches corrupted kernel responses or bit-flips.
+    // checked." We perform ONE narrow, always-valid check:
     //
-    // Valid CSIZE values: CS5 (0o00), CS6 (0o20), CS7 (0o40), CS8 (0o60)
-    // All have at least one bit in the CSIZE mask except CS5 which is 0.
-    // CS5 (5-bit characters) is extremely rare but technically valid.
-    // We check that c_cflag is not entirely zero (which would be nonsensical).
+    //   Reject a fully-zeroed c_cflag.
+    //
+    // A c_cflag of 0 implies no baud rate, no character size, and no control
+    // flags at all — a nonsensical configuration that indicates a corrupted
+    // kernel response or a bit-flip rather than a real terminal.
+    //
+    // We deliberately do NOT inspect the CSIZE bits to require a specific
+    // character size. CS5 (5-bit characters) has the bit pattern 0o00, so a
+    // valid CS5 terminal would have zero CSIZE bits. Demanding non-zero CSIZE
+    // bits would wrongly reject that legitimate (if rare) configuration.
+    // Checking only `c_cflag == 0` avoids false rejections while still
+    // catching the obviously-broken all-zero case.
     // -------------------------------------------------------------------------
     if termios.c_cflag == 0 {
-        // Completely zeroed c_cflag is invalid: no baud, no char size, no flags
-        // Return EINVAL to indicate invalid configuration
+        // EINVAL: invalid/garbled terminal configuration
         return Err(io::Error::from_raw_os_error(22)); // EINVAL
     }
 
@@ -614,11 +630,6 @@ fn get_terminal_attr(fd: i32) -> io::Result<Termios> {
 /// int ret = tcsetattr(fd, TCSANOW, &ios);  // or: ioctl(fd, TCSETS, &ios)
 /// ```
 fn set_terminal_attr(fd: i32, termios: &Termios) -> io::Result<()> {
-    // SAFETY:
-    // - termios points to valid, aligned memory (Rust reference guarantee)
-    // - TCSETS only reads from our memory and writes to kernel
-    // - The struct layout matches what the kernel expects
-    // - Cast to *mut is safe because TCSETS doesn't actually modify the struct
     // SAFETY: termios is a valid, properly aligned, readable Termios reference.
     // ioctl_write_termios + TCSETS reads from it to configure the terminal.
     // No *const-to-*mut cast needed: the write wrapper accepts *const directly.
@@ -899,6 +910,9 @@ impl RawTerminal {
     ///
     /// * `Ok(())` - Normal mode restored
     /// * `Err(io::Error)` - If restoring settings fails
+    ///
+    /// ## Idempotency
+    ///
     /// suspend_raw_mode / activate_raw_mode idempotency note
     /// Both methods are safe to call repeatedly or out of expected order
     /// (suspend twice, activate without suspend, etc.)
@@ -1127,9 +1141,23 @@ impl Drop for RawTerminal {
     ///
     /// Per production rules: errors must be logged even when not propagatable.
     fn drop(&mut self) {
-        if let Err(_e) = set_terminal_attr(self.tty.as_raw_fd(), &self.prev_ios) {
-            // Terse, no-heap error indication
-            // Note: stderr write can also fail; nothing more we can do
+        let fd = self.tty.as_raw_fd();
+
+        // Bounded retry: terminal restore is critical for shell usability, and
+        // EINTR (signal interruption) is an expected, transient failure on this
+        // syscall. Retry a fixed, small number of times — never an unbounded loop.
+        const RESTORE_ATTEMPTS: u8 = 3;
+        let mut restored = false;
+        for _ in 0..RESTORE_ATTEMPTS {
+            if set_terminal_attr(fd, &self.prev_ios).is_ok() {
+                restored = true;
+                break;
+            }
+        }
+
+        if !restored {
+            // Terse, no-heap, no-PII. The kernel usually resets the tty on
+            // process exit anyway; nothing further we can safely do here.
             let _ = std::io::stderr().write_all(b"RTDROP: term restore fail\r\n");
         }
     }
@@ -1147,6 +1175,14 @@ impl Read for RawTerminal {
     ///
     /// This means read() blocks until a key is pressed, then returns
     /// that byte immediately (no waiting for Enter).
+    ///
+    /// ## Short Reads (caller responsibility)
+    ///
+    /// Per the `std::io::Read` contract, this may return fewer bytes than
+    /// `buf.len()` — and in raw mode it frequently returns just 1 byte even
+    /// for a larger buffer (e.g. a multi-byte escape sequence arrives in
+    /// pieces). Callers MUST check the returned count and loop/accumulate as
+    /// needed; do not assume `buf` was filled. A return of `Ok(0)` means EOF.
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.tty.read(buf)
     }
@@ -1162,6 +1198,16 @@ impl Write for RawTerminal {
     /// - '\n' moves down one line but doesn't return to column 0
     /// - You must write "\r\n" for a proper newline
     /// - No automatic CR/LF translation
+    ///
+    /// ## Short Writes (caller responsibility)
+    ///
+    /// Per the `std::io::Write` contract, this may write fewer bytes than
+    /// `buf.len()` (e.g. a signal interrupts the underlying syscall, or the
+    /// tty buffer is full). Callers MUST check the returned count. To
+    /// guarantee a full buffer is emitted, use `write_all`, which loops over
+    /// this method until all bytes are written or an error occurs. Writing a
+    /// partial escape sequence and assuming success is a common source of
+    /// garbled terminal output.
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.tty.write(buf)
     }
@@ -1182,6 +1228,36 @@ impl Write for RawTerminal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_termios_field_offsets_v2() {
+        // Verifies the layout the kernel relies on for TCGETS/TCSETS.
+        use core::mem::offset_of;
+        assert_eq!(offset_of!(Termios, c_iflag), 0);
+        assert_eq!(offset_of!(Termios, c_oflag), 4);
+        assert_eq!(offset_of!(Termios, c_cflag), 8);
+        assert_eq!(offset_of!(Termios, c_lflag), 12);
+        assert_eq!(offset_of!(Termios, c_line), 16);
+        assert_eq!(offset_of!(Termios, c_cc), 17);
+    }
+
+    #[test]
+    fn test_make_raw_clears_critical_flags() {
+        let mut t = Termios {
+            c_iflag: 0xFFFF_FFFF,
+            c_oflag: 0xFFFF_FFFF,
+            c_cflag: 0xFFFF_FFFF,
+            c_lflag: 0xFFFF_FFFF,
+            c_line: 0,
+            c_cc: [0u8; 19],
+        };
+        make_raw(&mut t);
+        assert_eq!(t.c_lflag & ICANON, 0, "ICANON must be cleared");
+        assert_eq!(t.c_lflag & ECHO, 0, "ECHO must be cleared");
+        assert_eq!(t.c_cflag & CS8, CS8, "CS8 must be set");
+        assert_eq!(t.c_cc[VMIN], 1, "VMIN must be 1");
+        assert_eq!(t.c_cc[VTIME], 0, "VTIME must be 0");
+    }
 
     /// Verify termios struct has correct size for Linux x86_64.
     ///
