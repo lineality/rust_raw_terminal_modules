@@ -80,7 +80,7 @@
 
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 compile_error!(
-    "raw_terminal_x86 only supports Linux x86_64. \
+    "raw_terminal_x86_module only supports Linux x86_64. \
      Syscall numbers, ioctl request codes, and termios struct layouts \
      are architecture-specific. Porting to other architectures requires \
      different constants and potentially different struct definitions. \
@@ -848,7 +848,7 @@ impl RawTerminal {
     /// ## Example
     ///
     /// ```rust,no_run
-    /// use raw_terminal_x86::RawTerminal;
+    /// use raw_terminal_x86_module::RawTerminal;
     ///
     /// fn main() -> std::io::Result<()> {
     ///     let mut term = RawTerminal::new()?;
